@@ -1,20 +1,94 @@
 mod domain;
 
+use std::{collections::{HashMap, HashSet}, sync::Arc};
+
 pub use crate::domain::*;
 pub use atomic_register_public::*;
 pub use register_client_public::*;
 pub use sectors_manager_public::*;
 pub use transfer_public::*;
+use uuid::Uuid;
 
 pub async fn run_register_process(config: Configuration) {
     unimplemented!()
 }
 
+enum OperationType {
+    Read,
+    Write(SectorVec),
+}
+
+struct RegisterValue{
+    timestamp: u64,
+    write_rank: u8,
+    value: SectorVec,    
+}
+
+struct OperationState {
+    request_id: u64,
+    read_list: HashMap<u8,RegisterValue>,
+    ack_list: HashSet<u8>,
+    op_type: OperationType,
+    callback: Box<
+    dyn FnOnce(ClientCommandResponse) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + std::marker::Send>>
+        + std::marker::Send
+        + std::marker::Sync,
+    >,
+}
+
+struct AtomicRegisterNode{
+    ident: u8,
+    sector_idx: SectorIdx,
+    register_client: Arc<dyn RegisterClient>,
+    sectors_manager: Arc<dyn SectorsManager>,
+    processes_count: u8,
+    operation_states: HashMap<u64,OperationState>, // request_id -> OperationState
+    counter: u64, // for generating unique ids
+}
+
+#[async_trait::async_trait]
+impl AtomicRegister for AtomicRegisterNode {
+    async fn client_command(&mut self,cmd: ClientRegisterCommand,success_callback: Box<dyn FnOnce(ClientCommandResponse) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + std::marker::Send>> + std::marker::Send + std::marker::Sync>){
+        let op_id = cmd.header.request_identifier;
+
+        let op_type = match cmd.content {
+            (ClientRegisterCommandContent::Read) => {OperationType::Read},
+            (ClientRegisterCommandContent::Write { data }) => {OperationType::Write(data)}
+        };
+
+        let state = OperationState{
+            request_id:op_id,
+            read_list: HashMap::new(),
+            ack_list: HashSet::new(),
+            op_type:op_type,
+            callback:success_callback,
+        };
+
+        // we remember the state of the operation for every operation
+        self.operation_states.insert(op_id,state);
+
+        let msg = SystemRegisterCommand {
+            header:SystemCommandHeader{
+                process_identifier: self.ident,
+                msg_ident: Uuid::new_v4(),
+                sector_idx: self.sector_idx
+            },
+            content: SystemRegisterCommandContent::ReadProc
+        };
+        
+        self.register_client.broadcast(Broadcast { cmd: Arc::new(msg) }).await;
+    }
+
+    async fn system_command(&mut self, cmd: SystemRegisterCommand) {
+
+    }
+}
+
 pub mod atomic_register_public {
     use crate::{
-        ClientCommandResponse, ClientRegisterCommand, RegisterClient, SectorIdx, SectorsManager,
-        SystemRegisterCommand,
+        AtomicRegisterNode, ClientCommandResponse, ClientRegisterCommand, OperationState, RegisterClient, SectorIdx, SectorsManager, SystemRegisterCommand
     };
+    use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -56,7 +130,16 @@ pub mod atomic_register_public {
         sectors_manager: Arc<dyn SectorsManager>,
         processes_count: u8,
     ) -> Box<dyn AtomicRegister> {
-        unimplemented!()
+        Box::new(
+        AtomicRegisterNode{
+            ident:self_ident,
+            sector_idx:sector_idx,
+            register_client: register_client,
+            sectors_manager: sectors_manager,
+            processes_count: processes_count,
+            operation_states: HashMap::new(),
+            counter:0
+        })
     }
 }
 
