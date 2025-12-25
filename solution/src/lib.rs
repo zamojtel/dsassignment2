@@ -46,6 +46,19 @@ struct AtomicRegisterNode{
     counter: u64, // for generating unique ids
 }
 
+impl AtomicRegisterNode {
+   pub fn prepare_write_data(self_ident: u8,state: &OperationState,best: &RegisterValue) -> (u64,u8,SectorVec){
+        match &state.op_type {
+            OperationType::Read =>{
+                (best.timestamp,best.write_rank,best.value.clone())
+            },
+            OperationType::Write(sector_vec) => {
+                (best.timestamp+1,self_ident,sector_vec.clone())
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl AtomicRegister for AtomicRegisterNode {
     async fn client_command(&mut self,cmd: ClientRegisterCommand,success_callback: Box<dyn FnOnce(ClientCommandResponse) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + std::marker::Send>> + std::marker::Send + std::marker::Sync>){
@@ -64,7 +77,7 @@ impl AtomicRegister for AtomicRegisterNode {
             callback:success_callback,
         };
 
-        // we remember the state of the operation for every operation
+        // we remember the state for every operation
         self.operation_states.insert(op_id,state);
 
         let msg = SystemRegisterCommand {
@@ -80,7 +93,62 @@ impl AtomicRegister for AtomicRegisterNode {
     }
 
     async fn system_command(&mut self, cmd: SystemRegisterCommand) {
+        
+        match cmd.content  {
+            (SystemRegisterCommandContent::ReadProc) =>{
 
+            },
+            (SystemRegisterCommandContent::Value{timestamp,write_rank,sector_data}) =>{
+                for state in self.operation_states.values_mut() {
+
+                    let register_value = RegisterValue{
+                        timestamp,
+                        write_rank,
+                        value: sector_data.clone()
+                    };
+ 
+                    let process_id = cmd.header.process_identifier;
+                    state.read_list.insert(process_id, register_value);
+ 
+                    if state.read_list.len() > (self.processes_count as usize) / 2 {
+
+                        if let Some((_pid, best)) = state.read_list.iter().max_by_key(
+                            |(_pid,rv)| (rv.timestamp,rv.write_rank)
+                        ) {
+                            let (cmd_timestamp, cmd_write_rank, cmd_sector_data) = AtomicRegisterNode::prepare_write_data(self.ident, state, best);
+
+                            state.ack_list.clear();
+
+                            let header = SystemCommandHeader{
+                                process_identifier: self.ident,
+                                msg_ident: Uuid::new_v4(),
+                                sector_idx: self.sector_idx,
+                            };
+
+                            let content = SystemRegisterCommandContent::WriteProc { 
+                                timestamp: cmd_timestamp,
+                                write_rank: cmd_write_rank, 
+                                data_to_write: cmd_sector_data // send new data
+                            };
+
+                            self.register_client.broadcast(Broadcast { cmd: Arc::new(
+                                SystemRegisterCommand { 
+                                    header,
+                                    content 
+                                })
+                            }).await;
+                        }
+                    }   
+                }
+            },
+            (SystemRegisterCommandContent::WriteProc { timestamp, write_rank, data_to_write }) => {
+
+            },
+            (SystemRegisterCommandContent::Ack) => {
+
+            }
+        }
+        
     }
 }
 
