@@ -31,6 +31,10 @@ struct OperationState {
     read_list: HashMap<u8,RegisterValue>,
     ack_list: HashSet<u8>,
     op_type: OperationType,
+    // New Fields 
+    write_msg_ident: Option<Uuid>,
+    read_data: Option<SectorVec>,
+    // ----------------
     callback: Box<
     dyn FnOnce(ClientCommandResponse) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + std::marker::Send>>
         + std::marker::Send
@@ -44,6 +48,8 @@ struct AtomicRegisterNode{
     register_client: Arc<dyn RegisterClient>,
     sectors_manager: Arc<dyn SectorsManager>,
     processes_count: u8,
+    // in this map every operation that is currently being executed 
+    // is assigned with a unique number 
     operation_states: HashMap<u64,OperationState>, // request_id -> OperationState
     counter: u64, // for generating unique ids
 }
@@ -69,8 +75,8 @@ impl AtomicRegister for AtomicRegisterNode {
         let op_id = cmd.header.request_identifier;
 
         let op_type = match cmd.content {
-            (ClientRegisterCommandContent::Read) => {OperationType::Read},
-            (ClientRegisterCommandContent::Write { data }) => {OperationType::Write(data)}
+            ClientRegisterCommandContent::Read => {OperationType::Read},
+            ClientRegisterCommandContent::Write { data } => {OperationType::Write(data)}
         };
 
         let state = OperationState{
@@ -79,6 +85,8 @@ impl AtomicRegister for AtomicRegisterNode {
             ack_list: HashSet::new(),
             op_type:op_type,
             callback:success_callback,
+            write_msg_ident: None,
+            read_data: None,
         };
 
         // we remember the state for every operation
@@ -99,10 +107,10 @@ impl AtomicRegister for AtomicRegisterNode {
     async fn system_command(&mut self, cmd: SystemRegisterCommand) {
         
         match cmd.content  {
-            (SystemRegisterCommandContent::ReadProc) =>{
+            SystemRegisterCommandContent::ReadProc =>{
                 
             },
-            (SystemRegisterCommandContent::Value{timestamp,write_rank,sector_data}) =>{
+            SystemRegisterCommandContent::Value{timestamp,write_rank,sector_data} =>{
                 for state in self.operation_states.values_mut() {
                     let register_value = RegisterValue{
                         timestamp,
@@ -120,10 +128,16 @@ impl AtomicRegister for AtomicRegisterNode {
                             let (cmd_timestamp, cmd_write_rank, cmd_sector_data) = AtomicRegisterNode::prepare_write_data(self.ident, state, best);
 
                             state.ack_list.clear();
+                            let msg_ident = Uuid::new_v4();
+                            state.write_msg_ident = Some(msg_ident);
+
+                            if let OperationType::Read = state.op_type {
+                                state.read_data = Some(cmd_sector_data.clone());
+                            }
 
                             let header = SystemCommandHeader{
                                 process_identifier: self.ident,
-                                msg_ident: Uuid::new_v4(),
+                                msg_ident: msg_ident,
                                 sector_idx: self.sector_idx,
                             };
 
@@ -143,7 +157,7 @@ impl AtomicRegister for AtomicRegisterNode {
                     }   
                 }
             },
-            (SystemRegisterCommandContent::WriteProc { timestamp, write_rank, data_to_write }) => {
+            SystemRegisterCommandContent::WriteProc { timestamp, write_rank, data_to_write } => {
                 // gathering current data 
                 let (current_timestamp,current_write_rank) = self.sectors_manager.read_metadata(self.sector_idx).await;
                 // in rust tuples by default are compared lexicographically 
@@ -168,8 +182,41 @@ impl AtomicRegister for AtomicRegisterNode {
                     }
                 ).await;
             },
-            (SystemRegisterCommandContent::Ack) => {
-                // TODO
+            SystemRegisterCommandContent::Ack => {
+                let mut completed_op_id = None;
+                for state in self.operation_states.values_mut() {
+                    if state.write_msg_ident == Some(cmd.header.msg_ident) {
+                        state.ack_list.insert(cmd.header.process_identifier);
+
+                        if state.ack_list.len() > (self.processes_count as usize) / 2 {
+                            completed_op_id = Some(state.request_id);
+                        }
+                        break;
+                    }
+                } 
+
+                // node knows that some operation has been finished by getting an ack message
+                // then it can just return the answear to the client (one of possible many users)
+                // if the operation has finished we remove it from the list
+                // and invoke the callback function
+                if let Some(op_id) = completed_op_id {
+                    if let Some(state) = self.operation_states.remove(&op_id) {
+                        let op_return = match state.op_type {
+                            OperationType::Read => { 
+                                OperationReturn:: Read {read_data: state.read_data.unwrap() }
+                            },
+                            OperationType::Write(_) => OperationReturn::Write,
+                        };
+
+                        let response = ClientCommandResponse {
+                            status: StatusCode:: Ok,
+                            request_identifier: state.request_id,
+                            op_return
+                        };
+
+                        (state.callback)(response).await;
+                    }
+                }
             }
         }
         
