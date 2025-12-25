@@ -14,6 +14,7 @@ pub async fn run_register_process(config: Configuration) {
     unimplemented!()
 }
 
+// Added structs and functions
 enum OperationType {
     Read,
     Write(SectorVec),
@@ -59,6 +60,8 @@ impl AtomicRegisterNode {
         }
     }
 }
+
+// ---------------------------
 
 #[async_trait::async_trait]
 impl AtomicRegister for AtomicRegisterNode {
@@ -152,7 +155,7 @@ impl AtomicRegister for AtomicRegisterNode {
 
                 let header = SystemCommandHeader{
                     process_identifier: self.ident,
-                    msg_ident: Uuid::new_v4(),
+                    msg_ident: cmd.header.msg_ident, // zmienione na cmd.header.msg 
                     sector_idx: self.sector_idx,
                 };
 
@@ -166,7 +169,7 @@ impl AtomicRegister for AtomicRegisterNode {
                 ).await;
             },
             (SystemRegisterCommandContent::Ack) => {
-
+                // TODO
             }
         }
         
