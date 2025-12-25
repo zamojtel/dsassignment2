@@ -1,9 +1,10 @@
 mod domain;
 
-use std::{collections::{HashMap, HashSet}, sync::Arc};
+use std::{collections::{HashMap, HashSet}, sync::Arc, thread::current};
 
 pub use crate::domain::*;
 pub use atomic_register_public::*;
+use base64::write;
 pub use register_client_public::*;
 pub use sectors_manager_public::*;
 pub use transfer_public::*;
@@ -96,11 +97,10 @@ impl AtomicRegister for AtomicRegisterNode {
         
         match cmd.content  {
             (SystemRegisterCommandContent::ReadProc) =>{
-
+                
             },
             (SystemRegisterCommandContent::Value{timestamp,write_rank,sector_data}) =>{
                 for state in self.operation_states.values_mut() {
-
                     let register_value = RegisterValue{
                         timestamp,
                         write_rank,
@@ -111,7 +111,6 @@ impl AtomicRegister for AtomicRegisterNode {
                     state.read_list.insert(process_id, register_value);
  
                     if state.read_list.len() > (self.processes_count as usize) / 2 {
-
                         if let Some((_pid, best)) = state.read_list.iter().max_by_key(
                             |(_pid,rv)| (rv.timestamp,rv.write_rank)
                         ) {
@@ -142,7 +141,29 @@ impl AtomicRegister for AtomicRegisterNode {
                 }
             },
             (SystemRegisterCommandContent::WriteProc { timestamp, write_rank, data_to_write }) => {
+                // gathering current data 
+                let (current_timestamp,current_write_rank) = self.sectors_manager.read_metadata(self.sector_idx).await;
+                // in rust tuples by default are compared lexicographically 
+                // we can compare them like this 
+                if (current_timestamp,current_write_rank) < (timestamp,write_rank) {
+                    let to_write = (data_to_write,timestamp,write_rank);
+                    self.sectors_manager.write(self.sector_idx,&to_write).await;
+                }
 
+                let header = SystemCommandHeader{
+                    process_identifier: self.ident,
+                    msg_ident: Uuid::new_v4(),
+                    sector_idx: self.sector_idx,
+                };
+
+                let content = SystemRegisterCommandContent::Ack;
+                
+                self.register_client.send(
+                    Send { 
+                        cmd: Arc::new(SystemRegisterCommand { header, content }),
+                        target: cmd.header.process_identifier
+                    }
+                ).await;
             },
             (SystemRegisterCommandContent::Ack) => {
 
