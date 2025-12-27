@@ -1,17 +1,24 @@
 mod domain;
 
-use std::{collections::{HashMap, HashSet}, sync::Arc, thread::current};
+use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc, thread::current};
 
 pub use crate::domain::*;
 pub use atomic_register_public::*;
-use base64::write;
+use base64::{read, write};
 pub use register_client_public::*;
 pub use sectors_manager_public::*;
+use tokio::{net::TcpListener, sync::RwLock};
 pub use transfer_public::*;
 use uuid::Uuid;
 
 pub async fn run_register_process(config: Configuration) {
-    unimplemented!()
+    // unimplemented!()
+    let (host,port) = &config.public.tcp_locations[(config.public.self_rank-1) as usize];
+    let ip_with_port = format!("{}:{}",host,port);
+    let socket = TcpListener::bind(ip_with_port).await.unwrap();
+
+    let sectors_manager = build_sectors_manager(config.public.storage_dir.clone()).await;
+
 }
 
 // Added structs and functions
@@ -282,10 +289,38 @@ pub mod atomic_register_public {
     }
 }
 
+// structs and helper functions 
+fn parse_meta(name: &str) -> Option<(u64,u64,u8)> {
+    let mut it = name.split("_");
+
+    let sector_index: u64 = it.next()?.parse().ok()?;
+    let timestamp: u64 = it.next()?.parse().ok()?;
+    let write_rank: u8 = it.next()?.parse().ok()?;
+
+    if it.next().is_some() { return None; }
+
+    Some((sector_index,timestamp,write_rank))
+}
+
 pub mod sectors_manager_public {
-    use crate::{SectorIdx, SectorVec};
+    use tokio::sync::RwLock;
+    use crate::{SectorIdx, SectorVec, parse_meta};
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    struct DiskSectorsManager {
+        directory: PathBuf,
+        // required security for threads
+        metadata_cache: RwLock<HashMap<SectorIdx,(u64, u8)>>,
+    }
+
+    impl DiskSectorsManager{
+        async fn get_metadata(&self,idx: SectorIdx)-> Option<(u64,u8)> {
+            let cache = self.metadata_cache.read().await;
+            cache.get(&idx).copied()
+        }
+    }
 
     #[async_trait::async_trait]
     pub trait SectorsManager: Send + Sync {
@@ -303,9 +338,43 @@ pub mod sectors_manager_public {
 
     /// Path parameter points to a directory to which this method has exclusive access.
     pub async fn build_sectors_manager(path: PathBuf) -> Arc<dyn SectorsManager> {
-        unimplemented!()
+        // recovery process
+        let mut cache = HashMap::<SectorIdx,(u64, u8)>::new();
+        let mut directory = tokio::fs::read_dir(&path).await.unwrap();
+
+        while let Some(entry) = directory.next_entry().await.unwrap() {
+            let name_os = entry.file_name();
+            if let Some(name) = name_os.to_str() {
+                if let Some((sector_index,timestamp,write_rank)) = parse_meta(name) {
+                    cache.insert(sector_index,(timestamp,write_rank));
+                }
+            }
+        }
+       
+        Arc::new(DiskSectorsManager {
+            directory: path,
+            metadata_cache:  RwLock::new(cache),
+        })
     }
+
+    #[async_trait::async_trait]
+    impl SectorsManager for DiskSectorsManager {
+        async fn read_data(&self, idx: SectorIdx) -> SectorVec {
+            ()
+        }
+    
+        async fn read_metadata(&self, idx: SectorIdx) -> (u64, u8) {
+            if let Some()
+            // TODO
+        }
+    
+        async fn write(&self, idx: SectorIdx, sector: &(SectorVec, u64, u8)){
+            ()
+        }
+    }
+
 }
+
 
 pub mod transfer_public {
     use crate::RegisterCommand;
