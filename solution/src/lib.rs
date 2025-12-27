@@ -1,17 +1,24 @@
 mod domain;
 
-use std::{collections::{HashMap, HashSet}, sync::Arc, thread::current};
+use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc, thread::current};
 
 pub use crate::domain::*;
 pub use atomic_register_public::*;
-use base64::write;
+use base64::{read, write};
 pub use register_client_public::*;
 pub use sectors_manager_public::*;
+use tokio::{net::TcpListener, sync::RwLock};
 pub use transfer_public::*;
 use uuid::Uuid;
 
 pub async fn run_register_process(config: Configuration) {
-    unimplemented!()
+    // unimplemented!()
+    let (host,port) = &config.public.tcp_locations[(config.public.self_rank-1) as usize];
+    let ip_with_port = format!("{}:{}",host,port);
+    let socket = TcpListener::bind(ip_with_port).await.unwrap();
+
+    let sectors_manager = build_sectors_manager(config.public.storage_dir.clone()).await;
+
 }
 
 // Added structs and functions
@@ -282,10 +289,52 @@ pub mod atomic_register_public {
     }
 }
 
+// structs and helper functions 
+fn parse_meta(name: &str) -> Option<(u64,u64,u8)> {
+    let mut it = name.split("_");
+
+    let sector_index: u64 = it.next()?.parse().ok()?;
+    let timestamp: u64 = it.next()?.parse().ok()?;
+    let write_rank: u8 = it.next()?.parse().ok()?;
+
+    if it.next().is_some() { return None; }
+
+    Some((sector_index,timestamp,write_rank))
+}
+
+fn zero_sector() -> SectorVec {
+    SectorVec(Box::new(serde_big_array::Array([0u8; SECTOR_SIZE])))
+}
+
 pub mod sectors_manager_public {
-    use crate::{SectorIdx, SectorVec};
+    use base64::write;
+    use hmac::digest::generic_array::arr;
+    use hmac::digest::typenum::Zero;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::RwLock;
+    use crate::{SECTOR_SIZE, SectorIdx, SectorVec, parse_meta, zero_sector};
+    use std::collections::HashMap;
+    use std::fmt::format;
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    struct DiskSectorsManager {
+        directory: PathBuf,
+        // required security for threads
+        metadata_cache: RwLock<HashMap<SectorIdx,(u64, u8)>>,
+    }
+
+    impl DiskSectorsManager{
+        async fn get_metadata(&self,idx: SectorIdx)-> Option<(u64,u8)> {
+            let cache = self.metadata_cache.read().await;
+            cache.get(&idx).copied()
+        }
+
+        fn get_file_path(&self,file_name: &str) -> PathBuf {
+            self.directory.join(file_name)
+        }
+    }
 
     #[async_trait::async_trait]
     pub trait SectorsManager: Send + Sync {
@@ -303,9 +352,82 @@ pub mod sectors_manager_public {
 
     /// Path parameter points to a directory to which this method has exclusive access.
     pub async fn build_sectors_manager(path: PathBuf) -> Arc<dyn SectorsManager> {
-        unimplemented!()
+        // recovery process
+        let mut cache = HashMap::<SectorIdx,(u64, u8)>::new();
+        let mut directory = tokio::fs::read_dir(&path).await.unwrap();
+
+        while let Some(entry) = directory.next_entry().await.unwrap() {
+            let name_os = entry.file_name();
+            if let Some(name) = name_os.to_str() {
+                if let Some((sector_index,timestamp,write_rank)) = parse_meta(name) {
+                    cache.insert(sector_index,(timestamp,write_rank));
+                }
+            }
+        }
+       
+        Arc::new(DiskSectorsManager {
+            directory: path,
+            metadata_cache:  RwLock::new(cache),
+        })
     }
+
+    #[async_trait::async_trait]
+    impl SectorsManager for DiskSectorsManager {
+        async fn read_data(&self, idx: SectorIdx) -> SectorVec {
+            let (timestamp,write_rank) = self.read_metadata(idx).await;
+            
+            let file_name = format!("{}_{}_{}",idx,timestamp,write_rank);
+            let file_path = self.get_file_path(&file_name);
+
+            let mut file = match tokio::fs::File::open(&file_path).await {
+                Ok(f) => f,
+                Err(_e) => return zero_sector(),
+            };
+
+            let mut buffer = [0u8;SECTOR_SIZE];
+            if file.read_exact(&mut buffer).await.is_err() {
+                return zero_sector();
+            }
+
+            SectorVec(Box::new(serde_big_array::Array(buffer)))
+        }
+    
+        async fn read_metadata(&self, idx: SectorIdx) -> (u64, u8) {
+            let cache = self.metadata_cache.read().await;
+            match cache.get(&idx) {
+                Some(&(a,b)) => (a,b),
+                None => (0,0)
+            }
+        }
+
+        async fn write(&self, idx: SectorIdx, sector: &(SectorVec, u64, u8)){
+            let (data,timestamp,write_rank) = sector;
+
+            let target_file_name = format!("{}_{}_{}",idx,timestamp,write_rank);
+            let temp_file_name = format!("tmp_{}_{}_{}",idx,timestamp,write_rank);
+
+            let target_file_path = self.get_file_path(&target_file_name);
+            let temp_file_path = self.get_file_path(&temp_file_name);
+
+            let bytes: &[u8] = &data.0[..];
+
+            let mut file = tokio::fs::File::create(&temp_file_path).await.unwrap();
+            file.write_all(bytes).await.unwrap();
+            file.sync_all().await.unwrap();
+
+            tokio::fs::rename(&temp_file_path,&target_file_path).await.unwrap();
+
+            let mut cache = self.metadata_cache.write().await;
+            if let Some((old_timestamp,old_write_rank)) = cache.insert(idx,(*timestamp,*write_rank)) {
+                let old_file = format!("{}_{}_{}",idx,old_timestamp,old_write_rank);
+                let old_file_path = self.get_file_path(&old_file);
+                tokio::fs::remove_file(old_file_path).await.unwrap();
+            }
+        }
+    }
+
 }
+
 
 pub mod transfer_public {
     use crate::RegisterCommand;
