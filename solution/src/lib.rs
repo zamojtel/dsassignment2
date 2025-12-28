@@ -46,11 +46,7 @@ impl RegisterClient for TcpRegisterClient {
     async fn broadcast(&self,msg: Broadcast){
         for i in 0..self.config.public.tcp_locations.len() {
             let target_rank = (i+1) as u8;
-
-            if target_rank == self.config.public.self_rank {
-                continue;
-            }
-
+            
             self.send(Send {
                 cmd: msg.cmd.clone(),
                 target: target_rank, 
@@ -135,7 +131,7 @@ async fn get_or_create_register(
 
 
 async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     sectors_manager: Arc<dyn SectorsManager>,
     config:Arc<Configuration>,
     registers: RegisterMap,
@@ -238,9 +234,9 @@ pub async fn run_register_process(config: Configuration) {
     let registers: RegisterMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
     loop{
-        let (stream,peer_address) = match listener.accept().await{
+        let (stream,_peer_address) = match listener.accept().await{
             Ok(x) => x,
-            Err(e) => {
+            Err(_e) => {
                 continue;
             }
         };
@@ -294,7 +290,6 @@ struct AtomicRegisterNode{
     // in this map every operation that is currently being executed 
     // is assigned with a unique number 
     operation_states: HashMap<u64,OperationState>, // request_id -> OperationState
-    counter: u64, // for generating unique ids
 }
 
 impl AtomicRegisterNode {
@@ -348,10 +343,28 @@ impl AtomicRegister for AtomicRegisterNode {
     }
 
     async fn system_command(&mut self, cmd: SystemRegisterCommand) {
-        
         match cmd.content  {
             SystemRegisterCommandContent::ReadProc =>{
+                let (timestamp,write_rank) = self.sectors_manager.read_metadata(self.sector_idx).await;
+
+                let data = self.sectors_manager.read_data(self.sector_idx).await;
+                let header = SystemCommandHeader{
+                    process_identifier: self.ident,
+                    msg_ident: cmd.header.msg_ident,
+                    sector_idx: self.sector_idx,
+                };
+
+                let content = SystemRegisterCommandContent::Value { 
+                    timestamp,
+                    write_rank,
+                    sector_data: data 
+                };
                 
+                self.register_client.send(Send { 
+                    cmd: Arc::new(SystemRegisterCommand { header, content }),
+                    target: cmd.header.process_identifier, 
+                }).await;
+
             },
             SystemRegisterCommandContent::Value{timestamp,write_rank,sector_data} =>{
                 for state in self.operation_states.values_mut() {
@@ -519,8 +532,7 @@ pub mod atomic_register_public {
             register_client: register_client,
             sectors_manager: sectors_manager,
             processes_count: processes_count,
-            operation_states: HashMap::new(),
-            counter:0
+            operation_states: HashMap::new()
         })
     }
 }
@@ -557,10 +569,10 @@ pub mod sectors_manager_public {
     }
 
     impl DiskSectorsManager{
-        async fn get_metadata(&self,idx: SectorIdx)-> Option<(u64,u8)> {
-            let cache = self.metadata_cache.read().await;
-            cache.get(&idx).copied()
-        }
+        // async fn get_metadata(&self,idx: SectorIdx)-> Option<(u64,u8)> {
+        //     let cache = self.metadata_cache.read().await;
+        //     cache.get(&idx).copied()
+        // }
 
         fn get_file_path(&self,file_name: &str) -> PathBuf {
             self.directory.join(file_name)
