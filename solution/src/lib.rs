@@ -272,6 +272,24 @@ pub async fn run_register_process(config: Configuration) {
 
     let (self_tx, mut self_rx) = mpsc::unbounded_channel::<SystemRegisterCommand>();
 
+    let registers_gc = registers.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            
+            let mut map = registers_gc.write().await;
+            
+            map.retain(|_sector_idx, register| {
+                if let Ok(guard) = register.try_lock() {
+                    guard.has_pending_ops()
+                } else {
+                    true
+                }
+            });
+        }
+    });
+
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
@@ -514,6 +532,10 @@ impl AtomicRegister for AtomicRegisterNode {
             }
         }
     }
+
+    fn has_pending_ops(&self) -> bool {
+        !self.operation_states.is_empty()
+    }
 }
 
 pub mod atomic_register_public {
@@ -537,6 +559,7 @@ pub mod atomic_register_public {
             >,
         );
         async fn system_command(&mut self, cmd: SystemRegisterCommand);
+        fn has_pending_ops(&self) -> bool;
     }
 
     pub async fn build_atomic_register(
