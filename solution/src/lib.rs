@@ -307,15 +307,10 @@ fn zero_sector() -> SectorVec {
 }
 
 pub mod sectors_manager_public {
-    use base64::write;
-    use hmac::digest::generic_array::arr;
-    use hmac::digest::typenum::Zero;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::RwLock;
     use crate::{SECTOR_SIZE, SectorIdx, SectorVec, parse_meta, zero_sector};
     use std::collections::HashMap;
-    use std::fmt::format;
-    use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -430,10 +425,15 @@ pub mod sectors_manager_public {
 
 
 pub mod transfer_public {
-    use crate::RegisterCommand;
+    use crate::{RegisterCommand};
     use bincode::error::{DecodeError, EncodeError};
+    use hmac::{Hmac,Mac};
+    use sha2::Sha256;
     use std::io::Error;
-    use tokio::io::{AsyncRead, AsyncWrite};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    type HmacSha256 = Hmac<Sha256>;
+
     #[derive(Debug)]
     pub enum EncodingError {
         IoError(Error),
@@ -452,7 +452,47 @@ pub mod transfer_public {
         hmac_system_key: &[u8; 64],
         hmac_client_key: &[u8; 32],
     ) -> Result<(RegisterCommand, bool), DecodingError> {
-        unimplemented!()
+        let config = bincode::config::standard()
+        .with_big_endian()
+        .with_fixed_int_encoding();
+
+        let mut length_buffor = [0u8;8];
+        data.read_exact(&mut length_buffor).await.map_err(DecodingError::IoError)?;
+        // from BigEndian 
+        let length: u64 = u64::from_be_bytes(length_buffor); 
+
+        if length<32{
+            return Err(DecodingError::InvalidMessageSize)
+        }
+
+        let payload_length = std::cmp::max(0,length-32);
+        // tutaj musze uzyc vec bo length nie jest constant?
+        let mut body_buffor = vec![0u8; payload_length as usize];
+        data.read_exact(&mut body_buffor).await.map_err(DecodingError::IoError)?;
+
+        let mut hmac_buffor = [0u8;32];
+        data.read_exact(&mut hmac_buffor).await.map_err(DecodingError::IoError)?;
+
+        let (cmd,used) = bincode::serde::decode_from_slice::<RegisterCommand,_>(
+            body_buffor.as_slice(),
+            config
+        ).map_err(DecodingError::BincodeError)?;
+        
+        if used != body_buffor.len() {
+            return Err(DecodingError::BincodeError(
+                bincode::error::DecodeError::OtherString("trailing bytes".into()),
+            ));
+        }
+
+        let key: &[u8] = match &cmd {
+            RegisterCommand::System(_) => &hmac_system_key[..],
+            RegisterCommand::Client(_) => &hmac_client_key[..],
+        };
+        
+        let mut mac = HmacSha256::new_from_slice(key).expect("Hmac key init failed");
+        mac.update(&body_buffor);
+        let valid = mac.verify_slice(&hmac_buffor).is_ok();
+        Ok((cmd,valid))
     }
 
     pub async fn serialize_register_command(
@@ -460,7 +500,32 @@ pub mod transfer_public {
         writer: &mut (dyn AsyncWrite + Send + Unpin),
         hmac_key: &[u8],
     ) -> Result<(), EncodingError> {
-        unimplemented!()
+        let config = bincode::config::standard()
+        .with_big_endian()
+        .with_fixed_int_encoding();
+
+    
+        let payload: Vec<u8> = bincode::serde::encode_to_vec(cmd, config).map_err(EncodingError::BincodeError)?;
+
+        let mut mac = HmacSha256::new_from_slice(hmac_key).expect("Hmac key should have correct length");
+        mac.update(&payload);
+
+        let tag = mac.finalize().into_bytes();
+
+        let total_len = (payload.len() + tag.len()) as u64;
+        writer.write_all(&total_len.to_be_bytes())
+        .await
+        .map_err(EncodingError::IoError)?;
+
+        writer.write_all(&payload)
+        .await
+        .map_err(EncodingError::IoError)?;
+        
+        writer.write_all(tag.as_slice())
+        .await
+        .map_err(EncodingError::IoError)?;
+    
+        Ok(())
     }
 }
 
