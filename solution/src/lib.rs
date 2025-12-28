@@ -1,24 +1,151 @@
 mod domain;
 
 use std::{collections::{HashMap, HashSet}, sync::Arc};
-
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
 pub use crate::domain::*;
 pub use atomic_register_public::*;
 pub use register_client_public::*;
 pub use sectors_manager_public::*;
-use tokio::net::{TcpListener, TcpStream};
 pub use transfer_public::*;
 use uuid::Uuid;
+
+// added
+type RegisterMap = Arc<tokio::sync::RwLock<HashMap<SectorIdx,Arc<tokio::sync::Mutex<Box<dyn AtomicRegister>>>>>>;
+// client implementation for sending system messages 
+struct TcpRegisterClient {
+    config: Arc<Configuration>,
+}
+
+#[async_trait::async_trait]
+impl RegisterClient for TcpRegisterClient {
+    async fn send(&self,msg: Send) {
+        let target_idx = (msg.target-1) as usize;
+        if target_idx >= self.config.public.tcp_locations.len(){
+            return;
+        }
+
+        let (host,port) = &self.config.public.tcp_locations[target_idx];
+        let address = format!("{}:{}",host,port);
+
+        if let Ok(mut stream) = TcpStream::connect(address).await {
+            let system_cmd = msg.cmd.as_ref().clone();
+            let cmd_wrapper = RegisterCommand::System(system_cmd);
+
+            let _ = transfer_public::serialize_register_command(
+                &cmd_wrapper,
+                &mut stream,
+                &self.config.hmac_system_key
+            ).await;
+        }else{
+            // maybe some log informing that the connection could not
+            // be established
+        }
+    }
+
+    async fn broadcast(&self,msg: Broadcast){
+        for i in 0..self.config.public.tcp_locations.len() {
+            let target_rank = (i+1) as u8;
+
+            if target_rank == self.config.public.self_rank {
+                continue;
+            }
+
+            self.send(Send {
+                cmd: msg.cmd.clone(),
+                target: target_rank, 
+            }).await;
+        }
+    }
+
+}
+
+
+// helper function for sending responses to client (Linux Driver)
+async fn send_client_response(
+    response: &ClientCommandResponse,
+    writer: &mut (dyn tokio::io::AsyncWrite + std::marker::Send + Unpin),
+    hmac_key: &[u8]
+) -> Result<(), transfer_public::EncodingError> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    let config = bincode::config::standard()
+        .with_big_endian()
+        .with_fixed_int_encoding();
+
+    let payload = bincode::serde::encode_to_vec(response, config)
+        .map_err(EncodingError::BincodeError)?;
+    
+    let mut mac = HmacSha256::new_from_slice(hmac_key).expect("Invalid key length");
+    mac.update(&payload);
+    let tag = mac.finalize().into_bytes();
+
+    let total_len = (payload.len() + tag.len()) as u64;
+
+    writer.write_all(&total_len.to_be_bytes()).await.map_err(EncodingError::IoError)?;
+    writer.write_all(&payload).await.map_err(EncodingError::IoError)?;
+    writer.write_all(&tag).await.map_err(EncodingError::IoError)?;
+    
+    Ok(())
+}
+
+async fn get_or_create_register(
+    sector_idx: SectorIdx,
+    registers: &RegisterMap,
+    config: &Arc<Configuration>,
+    sectors_manager: &Arc<dyn SectorsManager>,
+) -> Arc<tokio::sync::Mutex<Box<dyn AtomicRegister>>> {
+    // this is a fast check 
+    // most of the times the rigister will be already created
+    {
+        let map = registers.read().await;
+        if let Some(register) = map.get(&sector_idx){
+            return register.clone()
+        }
+    }
+
+    // and here's a very important part
+    // some other thread could came before us and create another register 
+    // to avoid creating a duplicated register we check once again
+
+    let mut map = registers.write().await;
+
+    if let Some(register) = map.get(&sector_idx) {
+        return register.clone();
+    }
+
+    // here a new register is being created
+    let register_client = Arc::new(TcpRegisterClient { config: config.clone()});
+
+    let new_register = build_atomic_register(
+        config.public.self_rank,
+        sector_idx,
+        register_client,
+        sectors_manager.clone(),
+        config.public.tcp_locations.len() as u8
+    ).await;
+
+    let register_arc = Arc::new(tokio::sync::Mutex::new(new_register));
+    map.insert(sector_idx, register_arc.clone());
+
+    register_arc
+}
+
 
 async fn handle_connection(
     mut stream: TcpStream,
     sectors_manager: Arc<dyn SectorsManager>,
     config:Arc<Configuration>,
+    registers: RegisterMap,
 ) -> Result<(),std::io::Error>{
+    let (mut socket_reader,socket_writer) = stream.into_split();
+    let socket_writer = Arc::new(tokio::sync::Mutex::new(socket_writer));
 
     loop{
         let (cmd,hmac_ok) = match transfer_public::deserialize_register_command(
-            &mut stream,
+            &mut socket_reader,
             &config.hmac_system_key,
             &config.hmac_client_key,
         ).await{
@@ -33,11 +160,67 @@ async fn handle_connection(
                 if !hmac_ok {
                     continue;
                 }
+                let sector_idx = client_cmd.header.sector_idx;
+
+                if sector_idx >= config.public.n_sectors {
+                    let response = ClientCommandResponse {
+                        status: StatusCode::InvalidSectorIndex,
+                        request_identifier: client_cmd.header.request_identifier,
+                        op_return: match client_cmd.content {
+                            ClientRegisterCommandContent::Read => OperationReturn::Read { read_data: zero_sector()},
+                            ClientRegisterCommandContent::Write{ .. } => OperationReturn::Write,
+                        }
+                    };
+                    
+                    let writer = socket_writer.clone();
+                    let key = config.hmac_client_key;
+                    let mut guard = writer.lock().await;
+
+                    let _ = send_client_response(&response,& mut *guard,&key).await;
+                    continue;
+                }
+
+                let register = get_or_create_register(
+                    sector_idx,
+                    &registers,
+                    &config,
+                    &sectors_manager
+                ).await;
+
+                let writer = socket_writer.clone();
+                let key = config.hmac_client_key;
+
+                let callback = Box::new(move |response: ClientCommandResponse| 
+                    -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + std::marker::Send>> {
+                    
+                    Box::pin(async move {
+                        let mut guard = writer.lock().await;
+                        // Ignorujemy wynik wysyłania (Result), bo funkcja musi zwrócić ()
+                        let _ = send_client_response(&response, &mut *guard, &key).await;
+                    })
+                });
+
+                // the operation is run on the register
+                let mut guard = register.lock().await;
+                guard.client_command(client_cmd, callback).await;
             },
             RegisterCommand::System(system_cmd) => {
                 if !hmac_ok {
-                    return  Ok(());
+                    // connection is dropped
+                    return Ok(());
                 }
+
+                let sector_idx = system_cmd.header.sector_idx;
+
+                let register = get_or_create_register(
+                    sector_idx,
+                    &registers,
+                    &config,
+                    &sectors_manager
+                ).await;
+
+                let mut guard = register.lock().await;
+                guard.system_command(system_cmd).await;
             }
         }
     }
@@ -46,10 +229,13 @@ async fn handle_connection(
 pub async fn run_register_process(config: Configuration) {
     let (host,port) = &config.public.tcp_locations[(config.public.self_rank-1) as usize];
     let ip_with_port = format!("{}:{}",host,port);
-    let listener = TcpListener::bind(ip_with_port).await.unwrap();
 
+    let listener = TcpListener::bind(&ip_with_port).await.expect("Failed to bind TCP listener");
+    
     let sectors_manager = build_sectors_manager(config.public.storage_dir.clone()).await;
     let config = Arc::new(config);
+
+    let registers: RegisterMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
     loop{
         let (stream,peer_address) = match listener.accept().await{
@@ -61,10 +247,11 @@ pub async fn run_register_process(config: Configuration) {
 
         let sectors_manager = Arc::clone(&sectors_manager);
         let config = Arc::clone(&config);
+        let registers = Arc::clone(&registers);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream,sectors_manager,config).await {
-                eprintln!("conn from {peer_address} ended with error: {e}");
+            if let Err(_e) = handle_connection(stream,sectors_manager,config,registers).await {
+                // eprintln!("conn from {peer_address} ended with error: {e}");
             };
         });
     }
