@@ -4,6 +4,7 @@ use std::{collections::{HashMap, HashSet}, sync::Arc};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 pub use crate::domain::*;
+use tokio::sync::mpsc;
 pub use atomic_register_public::*;
 pub use register_client_public::*;
 pub use sectors_manager_public::*;
@@ -15,12 +16,21 @@ type RegisterMap = Arc<tokio::sync::RwLock<HashMap<SectorIdx,Arc<tokio::sync::Mu
 // client implementation for sending system messages 
 struct TcpRegisterClient {
     config: Arc<Configuration>,
+    self_sender: mpsc::UnboundedSender<SystemRegisterCommand>,
 }
 
 #[async_trait::async_trait]
 impl RegisterClient for TcpRegisterClient {
-    async fn send(&self,msg: Send) {
-        let target_idx = (msg.target-1) as usize;
+    async fn send(&self, msg: Send) {
+        let target_rank = msg.target;
+
+        if target_rank == self.config.public.self_rank {
+            let cmd = msg.cmd.as_ref().clone();
+            let _ = self.self_sender.send(cmd);
+            return;
+        }
+
+        let target_idx = (target_rank - 1) as usize;
         if target_idx >= self.config.public.tcp_locations.len(){
             return;
         }
@@ -37,13 +47,12 @@ impl RegisterClient for TcpRegisterClient {
                 &mut stream,
                 &self.config.hmac_system_key
             ).await;
-        }else{
-            // maybe some log informing that the connection could not
-            // be established
+        } else {
+            // connection failed
         }
     }
 
-    async fn broadcast(&self,msg: Broadcast){
+    async fn broadcast(&self, msg: Broadcast){
         for i in 0..self.config.public.tcp_locations.len() {
             let target_rank = (i+1) as u8;
             
@@ -53,11 +62,8 @@ impl RegisterClient for TcpRegisterClient {
             }).await;
         }
     }
-
 }
 
-
-// helper function for sending responses to client (Linux Driver)
 async fn send_client_response(
     response: &ClientCommandResponse,
     writer: &mut (dyn tokio::io::AsyncWrite + std::marker::Send + Unpin),
@@ -92,6 +98,7 @@ async fn get_or_create_register(
     registers: &RegisterMap,
     config: &Arc<Configuration>,
     sectors_manager: &Arc<dyn SectorsManager>,
+    self_sender: tokio::sync::mpsc::UnboundedSender<SystemRegisterCommand>,
 ) -> Arc<tokio::sync::Mutex<Box<dyn AtomicRegister>>> {
     // this is a fast check 
     // most of the times the rigister will be already created
@@ -113,7 +120,10 @@ async fn get_or_create_register(
     }
 
     // here a new register is being created
-    let register_client = Arc::new(TcpRegisterClient { config: config.clone()});
+    let register_client = Arc::new(TcpRegisterClient { 
+        config: config.clone(),
+        self_sender: self_sender, 
+    });
 
     let new_register = build_atomic_register(
         config.public.self_rank,
@@ -129,33 +139,65 @@ async fn get_or_create_register(
     register_arc
 }
 
+async fn process_system_command(
+    system_cmd: SystemRegisterCommand,
+    registers: &RegisterMap,
+    config: &Arc<Configuration>,
+    sectors_manager: &Arc<dyn SectorsManager>,
+    self_sender: &mpsc::UnboundedSender<SystemRegisterCommand>,
+) {
+    let sector_idx = system_cmd.header.sector_idx;
+    let register = get_or_create_register(
+        sector_idx,
+        registers,
+        config,
+        sectors_manager,
+        self_sender.clone()
+    ).await;
 
-async fn handle_connection(
+    let mut guard = register.lock().await;
+    guard.system_command(system_cmd).await;
+}
+
+async fn handle_tcp_connection(
     stream: TcpStream,
     sectors_manager: Arc<dyn SectorsManager>,
-    config:Arc<Configuration>,
+    config: Arc<Configuration>,
     registers: RegisterMap,
-) -> Result<(),std::io::Error>{
-    let (mut socket_reader,socket_writer) = stream.into_split();
+    self_sender: mpsc::UnboundedSender<SystemRegisterCommand>,
+) -> Result<(), std::io::Error> {
+    let (mut socket_reader, socket_writer) = stream.into_split();
     let socket_writer = Arc::new(tokio::sync::Mutex::new(socket_writer));
 
-    loop{
-        let (cmd,hmac_ok) = match transfer_public::deserialize_register_command(
+    loop {
+        let (cmd, hmac_ok) = match transfer_public::deserialize_register_command(
             &mut socket_reader,
             &config.hmac_system_key,
             &config.hmac_client_key,
-        ).await{
-            Ok(x)=> x,
+        ).await {
+            Ok(x) => x,
             Err(DecodingError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            // connection is dropped
-            Err(_) => return Ok(())
+            Err(_) => return Ok(()) // Drop connection on error
         };
 
         match cmd {
             RegisterCommand::Client(client_cmd) => {
                 if !hmac_ok {
-                    continue;
+                    let response = ClientCommandResponse {
+                        status: StatusCode::AuthFailure,
+                        request_identifier: client_cmd.header.request_identifier,
+                        op_return: match client_cmd.content {
+                            ClientRegisterCommandContent::Read => OperationReturn::Read { read_data: zero_sector() },
+                            ClientRegisterCommandContent::Write { .. } => OperationReturn::Write,
+                        }
+                    };
+                    let writer = socket_writer.clone();
+                    let key = config.hmac_client_key;
+                    let mut guard = writer.lock().await;
+                    let _ = send_client_response(&response, &mut *guard, &key).await;
+                    continue; 
                 }
+                
                 let sector_idx = client_cmd.header.sector_idx;
 
                 if sector_idx >= config.public.n_sectors {
@@ -171,7 +213,6 @@ async fn handle_connection(
                     let writer = socket_writer.clone();
                     let key = config.hmac_client_key;
                     let mut guard = writer.lock().await;
-
                     let _ = send_client_response(&response,& mut *guard,&key).await;
                     continue;
                 }
@@ -180,7 +221,8 @@ async fn handle_connection(
                     sector_idx,
                     &registers,
                     &config,
-                    &sectors_manager
+                    &sectors_manager,
+                    self_sender.clone()
                 ).await;
 
                 let writer = socket_writer.clone();
@@ -188,35 +230,20 @@ async fn handle_connection(
 
                 let callback = Box::new(move |response: ClientCommandResponse| 
                     -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + std::marker::Send>> {
-                    
                     Box::pin(async move {
                         let mut guard = writer.lock().await;
-                        // Ignorujemy wynik wysyłania (Result), bo funkcja musi zwrócić ()
                         let _ = send_client_response(&response, &mut *guard, &key).await;
                     })
                 });
 
-                // the operation is run on the register
                 let mut guard = register.lock().await;
                 guard.client_command(client_cmd, callback).await;
             },
             RegisterCommand::System(system_cmd) => {
                 if !hmac_ok {
-                    // connection is dropped
                     return Ok(());
                 }
-
-                let sector_idx = system_cmd.header.sector_idx;
-
-                let register = get_or_create_register(
-                    sector_idx,
-                    &registers,
-                    &config,
-                    &sectors_manager
-                ).await;
-
-                let mut guard = register.lock().await;
-                guard.system_command(system_cmd).await;
+                process_system_command(system_cmd, &registers, &config, &sectors_manager, &self_sender).await;
             }
         }
     }
@@ -230,30 +257,44 @@ pub async fn run_register_process(config: Configuration) {
     
     let sectors_manager = build_sectors_manager(config.public.storage_dir.clone()).await;
     let config = Arc::new(config);
-
     let registers: RegisterMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
-    loop{
-        let (stream,_peer_address) = match listener.accept().await{
-            Ok(x) => x,
-            Err(_e) => {
-                continue;
+    let (self_tx, mut self_rx) = mpsc::unbounded_channel::<SystemRegisterCommand>();
+
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, _)) => {
+                        let sectors_manager = Arc::clone(&sectors_manager);
+                        let config = Arc::clone(&config);
+                        let registers = Arc::clone(&registers);
+                        let self_tx = self_tx.clone();
+
+                        tokio::spawn(async move {
+                            let _ = handle_tcp_connection(stream, sectors_manager, config, registers, self_tx).await;
+                        });
+                    }
+                    Err(_) => {
+                        continue;
+                    }
+                }
             }
-        };
 
-        let sectors_manager = Arc::clone(&sectors_manager);
-        let config = Arc::clone(&config);
-        let registers = Arc::clone(&registers);
+            Some(system_cmd) = self_rx.recv() => {
+                let sectors_manager = Arc::clone(&sectors_manager);
+                let config = Arc::clone(&config);
+                let registers = Arc::clone(&registers);
+                let self_tx = self_tx.clone();
 
-        tokio::spawn(async move {
-            if let Err(_e) = handle_connection(stream,sectors_manager,config,registers).await {
-                // eprintln!("conn from {peer_address} ended with error: {e}");
-            };
-        });
+                tokio::spawn(async move {
+                    process_system_command(system_cmd, &registers, &config, &sectors_manager, &self_tx).await;
+                });
+            }
+        }
     }
 }
 
-// Added structs and functions
 enum OperationType {
     Read,
     Write(SectorVec),
@@ -270,30 +311,26 @@ struct OperationState {
     read_list: HashMap<u8,RegisterValue>,
     ack_list: HashSet<u8>,
     op_type: OperationType,
-    // New Fields 
     write_msg_ident: Option<Uuid>,
     read_data: Option<SectorVec>,
-    // ----------------
     callback: Box<
     dyn FnOnce(ClientCommandResponse) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + std::marker::Send>>
         + std::marker::Send
         + std::marker::Sync,
     >,
 }
-
 struct AtomicRegisterNode{
     ident: u8,
     sector_idx: SectorIdx,
     register_client: Arc<dyn RegisterClient>,
     sectors_manager: Arc<dyn SectorsManager>,
     processes_count: u8,
-    // in this map every operation that is currently being executed 
-    // is assigned with a unique number 
-    operation_states: HashMap<u64,OperationState>, // request_id -> OperationState
+    operation_states: HashMap<u64,OperationState>,
 }
 
+
 impl AtomicRegisterNode {
-   pub fn prepare_write_data(self_ident: u8,state: &OperationState,best: &RegisterValue) -> (u64,u8,SectorVec){
+    pub fn prepare_write_data(self_ident: u8,state: &OperationState,best: &RegisterValue) -> (u64,u8,SectorVec){
         match &state.op_type {
             OperationType::Read =>{
                 (best.timestamp,best.write_rank,best.value.clone())
@@ -304,8 +341,6 @@ impl AtomicRegisterNode {
         }
     }
 }
-
-// ---------------------------
 
 #[async_trait::async_trait]
 impl AtomicRegister for AtomicRegisterNode {
@@ -327,7 +362,6 @@ impl AtomicRegister for AtomicRegisterNode {
             read_data: None,
         };
 
-        // we remember the state for every operation
         self.operation_states.insert(op_id,state);
 
         let msg = SystemRegisterCommand {
@@ -414,10 +448,7 @@ impl AtomicRegister for AtomicRegisterNode {
                 }
             },
             SystemRegisterCommandContent::WriteProc { timestamp, write_rank, data_to_write } => {
-                // gathering current data 
                 let (current_timestamp,current_write_rank) = self.sectors_manager.read_metadata(self.sector_idx).await;
-                // in rust tuples by default are compared lexicographically 
-                // we can compare them like this 
                 if (current_timestamp,current_write_rank) < (timestamp,write_rank) {
                     let to_write = (data_to_write,timestamp,write_rank);
                     self.sectors_manager.write(self.sector_idx,&to_write).await;
@@ -425,7 +456,7 @@ impl AtomicRegister for AtomicRegisterNode {
 
                 let header = SystemCommandHeader{
                     process_identifier: self.ident,
-                    msg_ident: cmd.header.msg_ident, // zmienione na cmd.header.msg 
+                    msg_ident: cmd.header.msg_ident, 
                     sector_idx: self.sector_idx,
                 };
 
@@ -451,10 +482,6 @@ impl AtomicRegister for AtomicRegisterNode {
                     }
                 } 
 
-                // node knows that some operation has been finished by getting an ack message
-                // then it can just return the answear to the client (one of possible many users)
-                // if the operation has finished we remove it from the list
-                // and invoke the callback function
                 if let Some(op_id) = completed_op_id {
                     if let Some(state) = self.operation_states.remove(&op_id) {
                         let op_return = match state.op_type {
@@ -475,7 +502,6 @@ impl AtomicRegister for AtomicRegisterNode {
                 }
             }
         }
-        
     }
 }
 
@@ -490,12 +516,6 @@ pub mod atomic_register_public {
 
     #[async_trait::async_trait]
     pub trait AtomicRegister: Send + Sync {
-        /// Handle a client command. After the command is completed, we expect
-        /// callback to be called. Note that completion of client command happens after
-        /// delivery of multiple system commands to the register, as the algorithm specifies.
-        ///
-        /// This function corresponds to the handlers of Read and Write events in the
-        /// (N,N)-AtomicRegister algorithm.
         async fn client_command(
             &mut self,
             cmd: ClientRegisterCommand,
@@ -505,19 +525,9 @@ pub mod atomic_register_public {
                     + Sync,
             >,
         );
-
-        /// Handle a system command.
-        ///
-        /// This function corresponds to the handlers of `SystemRegisterCommand` messages in the (N,N)-AtomicRegister algorithm.
         async fn system_command(&mut self, cmd: SystemRegisterCommand);
     }
 
-    /// Idents are numbered starting at 1 (up to the number of processes in the system).
-    /// Communication with other processes of the system is to be done by `register_client`.
-    /// And sectors must be stored in the `sectors_manager` instance.
-    ///
-    /// This function corresponds to the handlers of Init and Recovery events in the
-    /// (N,N)-AtomicRegister algorithm.
     pub async fn build_atomic_register(
         self_ident: u8,
         sector_idx: SectorIdx,
@@ -537,16 +547,13 @@ pub mod atomic_register_public {
     }
 }
 
-// structs and helper functions 
+
 fn parse_meta(name: &str) -> Option<(u64,u64,u8)> {
     let mut it = name.split("_");
-
     let sector_index: u64 = it.next()?.parse().ok()?;
     let timestamp: u64 = it.next()?.parse().ok()?;
     let write_rank: u8 = it.next()?.parse().ok()?;
-
     if it.next().is_some() { return None; }
-
     Some((sector_index,timestamp,write_rank))
 }
 
@@ -714,7 +721,6 @@ pub mod transfer_public {
         }
 
         let payload_length = std::cmp::max(0,length-32);
-        // tutaj musze uzyc vec bo length nie jest constant?
         let mut body_buffor = vec![0u8; payload_length as usize];
         data.read_exact(&mut body_buffor).await.map_err(DecodingError::IoError)?;
 
