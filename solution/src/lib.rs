@@ -1,5 +1,4 @@
 mod domain;
-
 use std::time::Duration; 
 use std::{collections::{HashMap, HashSet}, sync::Arc};
 use tokio::io::AsyncWriteExt;
@@ -13,9 +12,7 @@ pub use transfer_public::*;
 use uuid::Uuid;
 use tokio::net::tcp::OwnedWriteHalf;
 
-// added
 type RegisterMap = Arc<tokio::sync::RwLock<HashMap<SectorIdx,Arc<tokio::sync::Mutex<Box<dyn AtomicRegister>>>>>>;
-// client implementation for sending system messages 
 struct TcpRegisterClient {
     config: Arc<Configuration>,
     self_sender: mpsc::UnboundedSender<SystemRegisterCommand>,
@@ -27,14 +24,12 @@ impl RegisterClient for TcpRegisterClient {
     async fn send(&self, msg: Send) {
         let target_rank = msg.target;
 
-        // 1. SELF-SEND (Optymalizacja Issue 1)
         if target_rank == self.config.public.self_rank {
             let cmd = msg.cmd.as_ref().clone();
             let _ = self.self_sender.send(cmd);
             return;
         }
 
-        // 2. STUBBORN LINKS + CONNECTION POOLING (Issue 2 & 5)
         let target_idx = (target_rank - 1) as usize;
         if target_idx >= self.config.public.tcp_locations.len() {
             return;
@@ -49,25 +44,21 @@ impl RegisterClient for TcpRegisterClient {
 
         tokio::spawn(async move {
             loop {
-                // KROK A: Pobieramy połączenie z puli (lub None)
                 let mut stream_opt = {
                     let mut guard = connections.lock().await;
                     guard.remove(&target_rank)
                 };
 
-                // KROK B: Jeśli brak połączenia, nawiązujemy nowe
                 if stream_opt.is_none() {
                     if let Ok(stream) = TcpStream::connect(&address).await {
                         let (_, write_half) = stream.into_split();
                         stream_opt = Some(write_half);
                     } else {
-                        // Błąd connect - czekamy i retry
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         continue;
                     }
                 }
 
-                // KROK C: Próbujemy wysłać
                 if let Some(mut stream) = stream_opt {
                     let cmd_wrapper = RegisterCommand::System(system_cmd.clone());
                     
@@ -76,12 +67,10 @@ impl RegisterClient for TcpRegisterClient {
                         &mut stream, 
                         &hmac_key
                     ).await.is_ok() {
-                        // SUKCES: Oddajemy połączenie do puli
                         let mut guard = connections.lock().await;
                         guard.insert(target_rank, stream);
                         break;
                     } 
-                    // Błąd send: Połączenie przepada (nie oddajemy go), pętla ponawia próbę
                 }
                 
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -99,79 +88,6 @@ impl RegisterClient for TcpRegisterClient {
         }
     }
 }
-
-// #[async_trait::async_trait]
-// impl RegisterClient for TcpRegisterClient {
-//     async fn send(&self, msg: Send) {
-//         let target_rank = msg.target;
-
-//         if target_rank == self.config.public.self_rank {
-//             let cmd = msg.cmd.as_ref().clone();
-//             let _ = self.self_sender.send(cmd);
-//             return;
-//         }
-
-
-//         let target_idx = (target_rank - 1) as usize;
-//         if target_idx >= self.config.public.tcp_locations.len() {
-//             return;
-//         }
-
-//         let (host, port) = &self.config.public.tcp_locations[target_idx];
-//         let address = format!("{}:{}", host, port);
-        
-//         let system_cmd = msg.cmd.as_ref().clone(); 
-//         let hmac_key = self.config.hmac_system_key;
-//         let connections = self.connections.clone(); 
-
-//         tokio::spawn(async move {
-//             loop {
-//                 let mut stream_opt = {
-//                     let mut guard = connections.lock().await;
-//                     guard.remove(&target_rank)
-//                 };
-
-//                 if stream_opt.is_none() {
-//                     if let Ok(stream) = TcpStream::connect(&address).await {
-//                         let (_, write_half) = stream.into_split();
-//                         stream_opt = Some(write_half);
-//                     } else {
-//                         tokio::time::sleep(Duration::from_millis(500)).await;
-//                         continue;
-//                     }
-//                 }
-
-//                 if let Some(mut stream) = stream_opt {
-//                     let cmd_wrapper = RegisterCommand::System(system_cmd.clone());
-                    
-//                     if transfer_public::serialize_register_command(
-//                         &cmd_wrapper, 
-//                         &mut stream, 
-//                         &hmac_key
-//                     ).await.is_ok() {
-//                         let mut guard = connections.lock().await;
-//                         guard.insert(target_rank, stream);
-//                         break; 
-//                     } else {
-
-//                     }
-//                 }
-                
-//                 tokio::time::sleep(Duration::from_millis(500)).await;
-//             }
-//         });
-//     }
-
-//     async fn broadcast(&self, msg: Broadcast){
-//         for i in 0..self.config.public.tcp_locations.len() {
-//             let target_rank = (i+1) as u8;
-//             self.send(Send {
-//                 cmd: msg.cmd.clone(),
-//                 target: target_rank, 
-//             }).await;
-//         }
-//     }
-// }
 
 async fn send_client_response(
     response: &ClientCommandResponse,
@@ -224,7 +140,7 @@ async fn get_or_create_register(
     let new_register = build_atomic_register(
         config.public.self_rank,
         sector_idx,
-        register_client, // Przekazujemy klienta dalej
+        register_client,
         sectors_manager.clone(),
         config.public.tcp_locations.len() as u8
     ).await;
@@ -234,105 +150,6 @@ async fn get_or_create_register(
 
     register_arc
 }
-
-// async fn get_or_create_register(
-//     sector_idx: SectorIdx,
-//     registers: &RegisterMap,
-//     config: &Arc<Configuration>,
-//     sectors_manager: &Arc<dyn SectorsManager>,
-//     register_client: Arc<TcpRegisterClient>, 
-// ) -> Arc<tokio::sync::Mutex<Box<dyn AtomicRegister>>> {
-//     {
-//         let map = registers.read().await;
-//         if let Some(register) = map.get(&sector_idx){
-//             return register.clone()
-//         }
-//     }
-
-//     let mut map = registers.write().await;
-//     if let Some(register) = map.get(&sector_idx) {
-//         return register.clone();
-//     }
-
-//     let new_register = build_atomic_register(
-//         config.public.self_rank,
-//         sector_idx,
-//         register_client,
-//         sectors_manager.clone(),
-//         config.public.tcp_locations.len() as u8
-//     ).await;
-
-//     let register_arc = Arc::new(tokio::sync::Mutex::new(new_register));
-//     map.insert(sector_idx, register_arc.clone());
-
-//     register_arc
-// }
-
-// async fn get_or_create_register(
-//     sector_idx: SectorIdx,
-//     registers: &RegisterMap,
-//     config: &Arc<Configuration>,
-//     sectors_manager: &Arc<dyn SectorsManager>,
-//     self_sender: tokio::sync::mpsc::UnboundedSender<SystemRegisterCommand>,
-// ) -> Arc<tokio::sync::Mutex<Box<dyn AtomicRegister>>> {
-
-//     {
-//         let map = registers.read().await;
-//         if let Some(register) = map.get(&sector_idx){
-//             return register.clone()
-//         }
-//     }
-
-//     // and here's a very important part
-//     // some other thread could came before us and create another register 
-//     // to avoid creating a duplicated register we check once again
-
-//     let mut map = registers.write().await;
-
-//     if let Some(register) = map.get(&sector_idx) {
-//         return register.clone();
-//     }
-
-//     // here a new register is being created
-//     let register_client = Arc::new(TcpRegisterClient { 
-//         config: config.clone(),
-//         self_sender: self_sender, 
-//     });
-
-//     let new_register = build_atomic_register(
-//         config.public.self_rank,
-//         sector_idx,
-//         register_client,
-//         sectors_manager.clone(),
-//         config.public.tcp_locations.len() as u8
-//     ).await;
-
-//     let register_arc = Arc::new(tokio::sync::Mutex::new(new_register));
-//     map.insert(sector_idx, register_arc.clone());
-
-//     register_arc
-// }
-
-
-// async fn process_system_command(
-//     system_cmd: SystemRegisterCommand,
-//     registers: &RegisterMap,
-//     config: &Arc<Configuration>,
-//     sectors_manager: &Arc<dyn SectorsManager>,
-//     tcp_client: Arc<TcpRegisterClient>, 
-// ) {
-//     let sector_idx = system_cmd.header.sector_idx;
-//     let register = get_or_create_register(
-//         sector_idx,
-//         registers,
-//         config,
-//         sectors_manager,
-//         tcp_client 
-//     ).await;
-
-//     let mut guard = register.lock().await;
-//     guard.system_command(system_cmd).await;
-// }
 
 async fn process_system_command(
     system_cmd: SystemRegisterCommand,
@@ -518,6 +335,7 @@ struct RegisterValue{
     value: SectorVec,    
 }
 
+
 struct OperationState {
     request_id: u64,
     read_list: HashMap<u8,RegisterValue>,
@@ -525,6 +343,8 @@ struct OperationState {
     op_type: OperationType,
     write_msg_ident: Option<Uuid>,
     read_data: Option<SectorVec>,
+    write_phase_started: bool,
+    
     callback: Box<
     dyn FnOnce(ClientCommandResponse) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + std::marker::Send>>
         + std::marker::Send
@@ -539,7 +359,6 @@ struct AtomicRegisterNode{
     processes_count: u8,
     operation_states: HashMap<u64,OperationState>,
 }
-
 
 impl AtomicRegisterNode {
     pub fn prepare_write_data(self_ident: u8,state: &OperationState,best: &RegisterValue) -> (u64,u8,SectorVec){
@@ -572,6 +391,7 @@ impl AtomicRegister for AtomicRegisterNode {
             callback:success_callback,
             write_msg_ident: None,
             read_data: None,
+            write_phase_started: false,
         };
 
         self.operation_states.insert(op_id,state);
@@ -623,7 +443,9 @@ impl AtomicRegister for AtomicRegisterNode {
                     let process_id = cmd.header.process_identifier;
                     state.read_list.insert(process_id, register_value);
  
-                    if state.read_list.len() > (self.processes_count as usize) / 2 {
+                    if state.read_list.len() > (self.processes_count as usize) / 2 && !state.write_phase_started {
+                        state.write_phase_started = true;
+
                         if let Some((_pid, best)) = state.read_list.iter().max_by_key(
                             |(_pid,rv)| (rv.timestamp,rv.write_rank)
                         ) {
@@ -646,7 +468,7 @@ impl AtomicRegister for AtomicRegisterNode {
                             let content = SystemRegisterCommandContent::WriteProc { 
                                 timestamp: cmd_timestamp,
                                 write_rank: cmd_write_rank, 
-                                data_to_write: cmd_sector_data // send new data
+                                data_to_write: cmd_sector_data 
                             };
 
                             self.register_client.broadcast(Broadcast { cmd: Arc::new(
