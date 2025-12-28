@@ -1,5 +1,6 @@
 mod domain;
 
+use std::time::Duration; 
 use std::{collections::{HashMap, HashSet}, sync::Arc};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -35,27 +36,37 @@ impl RegisterClient for TcpRegisterClient {
             return;
         }
 
-        let (host,port) = &self.config.public.tcp_locations[target_idx];
-        let address = format!("{}:{}",host,port);
+        let (host, port) = &self.config.public.tcp_locations[target_idx];
+        let address = format!("{}:{}", host, port);
+        
+        let system_cmd = msg.cmd.as_ref().clone(); 
+        let hmac_key = self.config.hmac_system_key;
 
-        if let Ok(mut stream) = TcpStream::connect(address).await {
-            let system_cmd = msg.cmd.as_ref().clone();
-            let cmd_wrapper = RegisterCommand::System(system_cmd);
-
-            let _ = transfer_public::serialize_register_command(
-                &cmd_wrapper,
-                &mut stream,
-                &self.config.hmac_system_key
-            ).await;
-        } else {
-            // connection failed
-        }
+        tokio::spawn(async move {
+            loop {
+                match TcpStream::connect(&address).await {
+                    Ok(mut stream) => {
+                        let cmd_wrapper = RegisterCommand::System(system_cmd.clone());
+                        
+                        if transfer_public::serialize_register_command(
+                            &cmd_wrapper, 
+                            &mut stream, 
+                            &hmac_key
+                        ).await.is_ok() {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        });
     }
 
     async fn broadcast(&self, msg: Broadcast){
         for i in 0..self.config.public.tcp_locations.len() {
             let target_rank = (i+1) as u8;
-            
             self.send(Send {
                 cmd: msg.cmd.clone(),
                 target: target_rank, 
