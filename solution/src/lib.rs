@@ -1,24 +1,73 @@
 mod domain;
 
-use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc, thread::current};
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 
 pub use crate::domain::*;
 pub use atomic_register_public::*;
-use base64::{read, write};
 pub use register_client_public::*;
 pub use sectors_manager_public::*;
-use tokio::{net::TcpListener, sync::RwLock};
+use tokio::net::{TcpListener, TcpStream};
 pub use transfer_public::*;
 use uuid::Uuid;
 
+async fn handle_connection(
+    mut stream: TcpStream,
+    sectors_manager: Arc<dyn SectorsManager>,
+    config:Arc<Configuration>,
+) -> Result<(),std::io::Error>{
+
+    loop{
+        let (cmd,hmac_ok) = match transfer_public::deserialize_register_command(
+            &mut stream,
+            &config.hmac_system_key,
+            &config.hmac_client_key,
+        ).await{
+            Ok(x)=> x,
+            Err(DecodingError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            // connection is dropped
+            Err(_) => return Ok(())
+        };
+
+        match cmd {
+            RegisterCommand::Client(client_cmd) => {
+                if !hmac_ok {
+                    continue;
+                }
+            },
+            RegisterCommand::System(system_cmd) => {
+                if !hmac_ok {
+                    return  Ok(());
+                }
+            }
+        }
+    }
+}
+
 pub async fn run_register_process(config: Configuration) {
-    // unimplemented!()
     let (host,port) = &config.public.tcp_locations[(config.public.self_rank-1) as usize];
     let ip_with_port = format!("{}:{}",host,port);
-    let socket = TcpListener::bind(ip_with_port).await.unwrap();
+    let listener = TcpListener::bind(ip_with_port).await.unwrap();
 
     let sectors_manager = build_sectors_manager(config.public.storage_dir.clone()).await;
+    let config = Arc::new(config);
 
+    loop{
+        let (stream,peer_address) = match listener.accept().await{
+            Ok(x) => x,
+            Err(e) => {
+                continue;
+            }
+        };
+
+        let sectors_manager = Arc::clone(&sectors_manager);
+        let config = Arc::clone(&config);
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream,sectors_manager,config).await {
+                eprintln!("conn from {peer_address} ended with error: {e}");
+            };
+        });
+    }
 }
 
 // Added structs and functions
@@ -232,7 +281,7 @@ impl AtomicRegister for AtomicRegisterNode {
 
 pub mod atomic_register_public {
     use crate::{
-        AtomicRegisterNode, ClientCommandResponse, ClientRegisterCommand, OperationState, RegisterClient, SectorIdx, SectorsManager, SystemRegisterCommand
+        AtomicRegisterNode, ClientCommandResponse, ClientRegisterCommand, RegisterClient, SectorIdx, SectorsManager, SystemRegisterCommand
     };
     use std::collections::HashMap;
     use std::future::Future;
