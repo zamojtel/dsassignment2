@@ -633,10 +633,9 @@ pub mod sectors_manager_public {
         /// Writes a new data, along with timestamp and write rank to some sector.
         async fn write(&self, idx: SectorIdx, sector: &(SectorVec, u64, u8));
     }
-
+    
     /// Path parameter points to a directory to which this method has exclusive access.
     pub async fn build_sectors_manager(path: PathBuf) -> Arc<dyn SectorsManager> {
-        // recovery process
         let mut cache = HashMap::<SectorIdx,(u64, u8)>::new();
         let mut directory = tokio::fs::read_dir(&path).await.unwrap();
 
@@ -644,7 +643,11 @@ pub mod sectors_manager_public {
             let name_os = entry.file_name();
             if let Some(name) = name_os.to_str() {
                 if let Some((sector_index,timestamp,write_rank)) = parse_meta(name) {
-                    cache.insert(sector_index,(timestamp,write_rank));
+                    cache.entry(sector_index)
+                        .and_modify(|current_val| {
+                            *current_val = std::cmp::max(*current_val, (timestamp, write_rank));
+                        })
+                        .or_insert((timestamp, write_rank));
                 }
             }
         }
